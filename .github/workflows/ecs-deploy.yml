@@ -1,0 +1,417 @@
+name: ECS Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+  TERRAFORM_DIR: infra/terraform
+  LAB_ROLE_NAME: LabRole
+  TF_STATE_KEY: shopsmart/dev.tfstate
+
+jobs:
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            client/package-lock.json
+            server/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Create test report directories
+        run: |
+          mkdir -p server/test-results
+          mkdir -p client/test-results
+
+      - name: Run backend lint
+        working-directory: server
+        run: npm run lint
+
+      - name: Run backend tests
+        working-directory: server
+        run: npm run test -- --json --outputFile=./test-results/jest-report.json
+
+      - name: Run frontend lint
+        working-directory: client
+        run: npm run lint
+
+      - name: Run frontend tests
+        working-directory: client
+        run: npm run test -- --reporter=default --reporter=junit --outputFile=./test-results/vitest-report.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            server/test-results
+            client/test-results
+          retention-days: 7
+
+  terraform:
+    name: Terraform Provisioning
+    runs-on: ubuntu-latest
+    needs: tests
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Bootstrap Terraform state bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          STATE_BUCKET="shopsmart-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
+          if ! aws s3api head-bucket --bucket "${STATE_BUCKET}" >/dev/null 2>&1; then
+            if [ "${AWS_REGION}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "${STATE_BUCKET}"
+            else
+              aws s3api create-bucket \
+                --bucket "${STATE_BUCKET}" \
+                --create-bucket-configuration LocationConstraint="${AWS_REGION}"
+            fi
+            aws s3api put-bucket-versioning \
+              --bucket "${STATE_BUCKET}" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption \
+              --bucket "${STATE_BUCKET}" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-public-access-block \
+              --bucket "${STATE_BUCKET}" \
+              --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+          echo "TF_STATE_BUCKET=${STATE_BUCKET}" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Terraform fmt check
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform fmt -check
+
+      - name: Terraform validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform plan \
+            -var="lab_role_name=${LAB_ROLE_NAME}" \
+            -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            ${{ env.TERRAFORM_DIR }}/tfplan
+            ${{ env.TERRAFORM_DIR }}/tfplan.txt
+          retention-days: 7
+
+      - name: Terraform apply
+        if: github.event_name != 'pull_request'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export Terraform outputs
+        if: github.event_name != 'pull_request'
+        id: outputs_json
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform output -json > terraform-outputs.json
+          BACKEND_URL=$(jq -r '.backend_service_url.value' terraform-outputs.json)
+          echo "backend_service_url=${BACKEND_URL}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Terraform Outputs"
+            echo ""
+            echo "- Backend URL: ${BACKEND_URL}"
+            echo "- Artifact Bucket: $(jq -r '.artifact_bucket_name.value' terraform-outputs.json)"
+            echo "- ECR Repository: $(jq -r '.ecr_repository_url.value' terraform-outputs.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Terraform outputs
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: ${{ env.TERRAFORM_DIR }}/terraform-outputs.json
+          retention-days: 7
+
+  deploy-backend:
+    name: Build Push and Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Bootstrap Terraform state bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          STATE_BUCKET="shopsmart-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
+          if ! aws s3api head-bucket --bucket "${STATE_BUCKET}" >/dev/null 2>&1; then
+            if [ "${AWS_REGION}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "${STATE_BUCKET}"
+            else
+              aws s3api create-bucket \
+                --bucket "${STATE_BUCKET}" \
+                --create-bucket-configuration LocationConstraint="${AWS_REGION}"
+            fi
+            aws s3api put-bucket-versioning \
+              --bucket "${STATE_BUCKET}" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption \
+              --bucket "${STATE_BUCKET}" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-public-access-block \
+              --bucket "${STATE_BUCKET}" \
+              --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+          echo "TF_STATE_BUCKET=${STATE_BUCKET}" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Refresh Terraform outputs
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform output -json > terraform-outputs.json
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Parse Terraform outputs
+        id: terraform_outputs
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          OUTPUTS_JSON=$(cat terraform-outputs.json | jq -c '.')
+          echo "outputs_json=${OUTPUTS_JSON}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend image
+        env:
+          ECR_REPOSITORY_URL: ${{ fromJSON(steps.terraform_outputs.outputs.outputs_json).ecr_repository_url.value }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f server/Dockerfile -t "${ECR_REPOSITORY_URL}:${IMAGE_TAG}" -t "${ECR_REPOSITORY_URL}:latest" server
+          docker push "${ECR_REPOSITORY_URL}:${IMAGE_TAG}"
+          docker push "${ECR_REPOSITORY_URL}:latest"
+
+      - name: Register task definition
+        id: task_def
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        env:
+          TF_OUTPUTS: ${{ steps.terraform_outputs.outputs.outputs_json }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ECR_REPOSITORY_URL=$(echo "${TF_OUTPUTS}" | jq -r '.ecr_repository_url.value')
+          EXECUTION_ROLE_ARN=$(echo "${TF_OUTPUTS}" | jq -r '.ecs_task_execution_role_arn.value')
+          TASK_ROLE_ARN=$(echo "${TF_OUTPUTS}" | jq -r '.ecs_task_role_arn.value')
+          TASK_FAMILY=$(echo "${TF_OUTPUTS}" | jq -r '.ecs_task_family.value')
+          CONTAINER_NAME=$(echo "${TF_OUTPUTS}" | jq -r '.backend_container_name.value')
+          CONTAINER_PORT=$(echo "${TF_OUTPUTS}" | jq -r '.backend_container_port.value')
+          LOG_GROUP=$(echo "${TF_OUTPUTS}" | jq -r '.backend_log_group_name.value')
+          TASK_CPU=$(echo "${TF_OUTPUTS}" | jq -r '.backend_task_cpu.value')
+          TASK_MEMORY=$(echo "${TF_OUTPUTS}" | jq -r '.backend_task_memory.value')
+
+          jq -n \
+            --arg family "${TASK_FAMILY}" \
+            --arg executionRoleArn "${EXECUTION_ROLE_ARN}" \
+            --arg taskRoleArn "${TASK_ROLE_ARN}" \
+            --arg containerName "${CONTAINER_NAME}" \
+            --arg image "${ECR_REPOSITORY_URL}:${IMAGE_TAG}" \
+            --arg logGroup "${LOG_GROUP}" \
+            --arg awsRegion "${AWS_REGION}" \
+            --argjson containerPort "${CONTAINER_PORT}" \
+            --arg cpu "${TASK_CPU}" \
+            --arg memory "${TASK_MEMORY}" \
+            '{
+              family: $family,
+              networkMode: "awsvpc",
+              requiresCompatibilities: ["FARGATE"],
+              cpu: $cpu,
+              memory: $memory,
+              executionRoleArn: $executionRoleArn,
+              taskRoleArn: $taskRoleArn,
+              containerDefinitions: [
+                {
+                  name: $containerName,
+                  image: $image,
+                  essential: true,
+                  portMappings: [
+                    {
+                      containerPort: $containerPort,
+                      hostPort: $containerPort,
+                      protocol: "tcp"
+                    }
+                  ],
+                  environment: [
+                    {
+                      name: "PORT",
+                      value: ($containerPort | tostring)
+                    }
+                  ],
+                  logConfiguration: {
+                    logDriver: "awslogs",
+                    options: {
+                      "awslogs-group": $logGroup,
+                      "awslogs-region": $awsRegion,
+                      "awslogs-stream-prefix": "ecs"
+                    }
+                  }
+                }
+              ]
+            }' > task-definition.json
+
+          TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task_definition_arn=${TASK_DEFINITION_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update ECS service
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        env:
+          TF_OUTPUTS: ${{ steps.terraform_outputs.outputs.outputs_json }}
+          TASK_DEFINITION_ARN: ${{ steps.task_def.outputs.task_definition_arn }}
+        run: |
+          CLUSTER_NAME=$(echo "${TF_OUTPUTS}" | jq -r '.ecs_cluster_name.value')
+          SERVICE_NAME=$(echo "${TF_OUTPUTS}" | jq -r '.ecs_service_name.value')
+          TARGET_GROUP_ARN=$(echo "${TF_OUTPUTS}" | jq -r '.alb_target_group_arn.value')
+          CONTAINER_NAME=$(echo "${TF_OUTPUTS}" | jq -r '.backend_container_name.value')
+          CONTAINER_PORT=$(echo "${TF_OUTPUTS}" | jq -r '.backend_container_port.value')
+          DESIRED_COUNT=$(echo "${TF_OUTPUTS}" | jq -r '.backend_desired_count.value')
+          SECURITY_GROUP=$(echo "${TF_OUTPUTS}" | jq -r '.ecs_security_group_id.value')
+          SUBNETS=$(echo "${TF_OUTPUTS}" | jq -c '.ecs_subnet_ids.value')
+
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster "${CLUSTER_NAME}" \
+            --services "${SERVICE_NAME}" \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || true)
+
+          if [ -z "${SERVICE_STATUS}" ] || [ "${SERVICE_STATUS}" = "None" ] || [ "${SERVICE_STATUS}" = "MISSING" ]; then
+            jq -n \
+              --arg cluster "${CLUSTER_NAME}" \
+              --arg serviceName "${SERVICE_NAME}" \
+              --arg taskDefinition "${TASK_DEFINITION_ARN}" \
+              --argjson desiredCount "${DESIRED_COUNT}" \
+              --arg targetGroupArn "${TARGET_GROUP_ARN}" \
+              --arg containerName "${CONTAINER_NAME}" \
+              --argjson containerPort "${CONTAINER_PORT}" \
+              --arg securityGroup "${SECURITY_GROUP}" \
+              --argjson subnets "${SUBNETS}" \
+              '{
+                cluster: $cluster,
+                serviceName: $serviceName,
+                taskDefinition: $taskDefinition,
+                desiredCount: $desiredCount,
+                launchType: "FARGATE",
+                deploymentConfiguration: {
+                  deploymentCircuitBreaker: {
+                    enable: true,
+                    rollback: true
+                  },
+                  maximumPercent: 200,
+                  minimumHealthyPercent: 50
+                },
+                networkConfiguration: {
+                  awsvpcConfiguration: {
+                    assignPublicIp: "ENABLED",
+                    securityGroups: [$securityGroup],
+                    subnets: $subnets
+                  }
+                },
+                loadBalancers: [
+                  {
+                    targetGroupArn: $targetGroupArn,
+                    containerName: $containerName,
+                    containerPort: $containerPort
+                  }
+                ]
+              }' > service-definition.json
+
+            aws ecs create-service --cli-input-json file://service-definition.json
+          else
+            aws ecs update-service \
+              --cluster "${CLUSTER_NAME}" \
+              --service "${SERVICE_NAME}" \
+              --task-definition "${TASK_DEFINITION_ARN}" \
+              --force-new-deployment
+          fi
+
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER_NAME}" \
+            --services "${SERVICE_NAME}"
+
+          {
+            echo "## ECS Deployment"
+            echo ""
+            echo "- Cluster: ${CLUSTER_NAME}"
+            echo "- Service: ${SERVICE_NAME}"
+            echo "- Task Definition: ${TASK_DEFINITION_ARN}"
+            echo "- Backend URL: $(echo "${TF_OUTPUTS}" | jq -r '.backend_service_url.value')"
+          } >> "$GITHUB_STEP_SUMMARY"

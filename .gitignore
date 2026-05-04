@@ -21,6 +21,13 @@ playwright-report/
 test-results/
 *.snap
 
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform-outputs.json
+
 # Logs
 *.log
 npm-debug.log*
