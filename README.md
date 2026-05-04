@@ -9,8 +9,9 @@ Add these in `Settings -> Secrets and variables -> Actions`:
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
 - `AWS_SESSION_TOKEN`
-- `AWS_REGION`
 - `VITE_API_BASE_URL`
+
+The AWS workflows are pinned to `us-east-1`.
 
 `LabRole` is used by the Terraform stack for ECS task execution and task permissions, which fits the default AWS Academy learner lab setup.
 
